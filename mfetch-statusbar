@@ -1,0 +1,281 @@
+#!/usr/bin/env bash
+set -u
+
+# Intervalo entre atualizações, em segundos (usado pelo dorminhoco no fim).
+INTERVAL=1
+
+# Partição monitorada pelo bloco "HDD".
+DISK_PATH="/"
+
+#- CPU_PREV_TOTAL: soma de todos os tempos na leitura anterior.
+#- CPU_PREV_IDLE:  (nome enganoso) guarda o BUSY anterior, não o idle.
+CPU_PREV_TOTAL=0
+CPU_PREV_IDLE=0
+
+# Texto de cada bloco
+CPU_TEXT='...'
+RAM_TEXT='N/A'
+NET_TEXT='OFF'
+DISK_TEXT='N/A'
+BAT_TEXT='N/A'
+CLOCK_TEXT=''
+
+# json_escape: torna um texto seguro para embutir numa string JSON.
+# Em JSON, certos caracteres precisam ser escapados com barra invertida.
+#   \  -> \\      (a própria barra invertida)
+#   "  -> \"      (a aspa dupla, que fecharia a string)
+#   \n -> \n      (quebra de linha literal -> sequência escapada)
+#   \r -> \r      (retorno de carro)
+#   \t -> \t      (tabulação)
+# A ORDEM importa: a barra invertida deve ser escapada PRIMEIRO, senão as
+# barras inseridas pelas trocas seguintes seriam escapadas duas vezes.
+json_escape() {
+    local s=${1//\\/\\\\}
+    s=${s//\"/\\\"}
+    s=${s//$'\n'/\\n}
+    s=${s//$'\r'/\\r}
+    s=${s//$'\t'/\\t}
+    printf '%s' "$s"
+}
+
+# Bloco da CPU
+# Lê a linha "cpu ..." de /proc/stat, que contém os tempos acumulados.
+# IMPORTANTE: esta função NUNCA deve ser chamada dentro de $( ), porque a
+# substituição de comando roda num subprocesso — e o estado CPU_PREV_* seria
+# perdido ao terminar. Por isso ela grava em CPU_TEXT e é chamada direto.
+get_cpu() {
+    local user nice system idle iowait irq softirq steal
+    local total busy delta_total delta_busy pct
+
+    read -r _ user nice system idle iowait irq softirq steal _ \
+        < /proc/stat
+
+    # Tempo total observado e tempo de trabalho (tudo menos ocioso).
+    total=$((user + nice + system + idle + iowait + irq + softirq + steal))
+    busy=$((total - idle - iowait))
+
+    # Na primeira execução ainda não há leitura anterior (total = 0), então
+    # mostramos "..." até o próximo ciclo fornecer um intervalo válido.
+    if (( CPU_PREV_TOTAL > 0 )); then
+        delta_total=$((total - CPU_PREV_TOTAL))
+
+        if (( delta_total > 0 )); then
+            # Trabalho realizado DURANTE o intervalo (diferença dos totais).
+            delta_busy=$((busy - CPU_PREV_IDLE))
+
+            # Se os contadores recuarem entre leituras (raro), limita a 0
+            (( delta_busy < 0 )) && delta_busy=0
+
+            # Aritmética INTEIRA com 2 casas decimais.
+            # Multiplicamos por 10000 antes de dividir para "guardar" as casas:
+            #   pct fica em centésimos de porcento (ex.: 1234 = 12,34%).
+            # Depois imprimimos como inteiro + parte fracionária de 2 dígitos:
+            #   pct/100 = parte inteira;  pct%100 = dois dígitos da fração.
+            pct=$((delta_busy * 10000 / delta_total))
+            printf -v CPU_TEXT '%d.%02d%%' $((pct / 100)) $((pct % 100))
+        else
+            # Sem intervalo mensurável (contadores iguais) — mostra "?".
+            CPU_TEXT='?'
+        fi
+    else
+        CPU_TEXT='...'
+    fi
+
+    # Guarda a leitura atual como referência para o próximo ciclo.
+    CPU_PREV_TOTAL=$total
+    CPU_PREV_IDLE=$busy
+}
+
+# Bloco da RAM
+# Lê /proc/meminfo (valores em KiB) e calcula usada/total.
+#
+# Usa "MemAvailable" em vez de "MemFree" porque MemAvailable já embute uma
+# estimativa de memória reaproveitável (cache), refletindo melhor o que o
+# usuário realmente tem disponível.
+get_ram() {
+    RAM_TEXT=$(awk '
+        /^MemTotal:/     { total = $2 }
+        /^MemAvailable:/ { available = $2 }
+        END {
+            if (total > 0) {
+                used = (total - available) / 1048576
+                total_gib = total / 1048576
+                printf "%.1f/%.1f GiB", used, total_gib
+            } else {
+                printf "N/A"
+            }
+        }
+    ' /proc/meminfo)
+
+}
+
+# Bloco de rede (ON ou OFF)
+# Pergunta única: existe uma ROTA PADRÃO (default route)?
+# Se sim, há conectividade -> ON. Se não -> OFF.
+#
+# Lemos /proc/net/route DIRETAMENTE, ao em vez de utilizar nmcli ou ping para identificar
+# Se o user está conectado a rede.
+get_network() {
+    local route_file="${MFETCH_ROUTE_FILE:-/proc/net/route}"
+    local l_if l_dest l_mask rest
+
+    NET_TEXT='OFF'
+    while read -r l_if l_dest _ _ _ _ _ l_mask rest; do
+        if [[ "$l_dest" == "00000000" && "$l_mask" == "00000000" ]]; then
+            NET_TEXT='ON'
+            return
+        fi
+    done < "$route_file"
+}
+
+# Bloco de disco
+get_disk() {
+    DISK_TEXT=$(df -B1 "$DISK_PATH" 2>/dev/null |
+        awk 'NR == 2 {
+            total = $2
+            used = $3
+
+            if (total > 0) {
+                printf "%.1f/%.1f GiB (%d%%)",
+                    used / 1073741824,
+                    total / 1073741824,
+                    used * 100 / total
+            } else {
+                printf "N/A"
+            }
+        }')
+}
+
+# Bloco de Bateria
+# Percorre /sys/class/power_supply/* (ex.: BAT0, AC). Para cada dispositivo.
+
+get_battery() {
+    local path capacity
+
+    for path in /sys/class/power_supply/*; do
+        [[ -r "$path/type" && -r "$path/capacity" ]] || continue
+        [[ "$(<"$path/type")" == "Battery" ]] || continue
+
+        capacity=$(<"$path/capacity")
+
+        if [[ "$capacity" =~ ^[0-9]+$ ]]; then
+            printf -v BAT_TEXT '%s%%' "$capacity"
+            return
+        fi
+    done
+
+    BAT_TEXT='N/A'
+}
+
+# -----------------------------------------------------------------------------
+# emit_block: imprime UM bloco JSON no formato do i3bar.
+# -----------------------------------------------------------------------------
+# Recebe o nome e o texto do bloco, escapa ambos para JSON e imprime.
+#
+# A variável FIRST_BLOCK resolve um detalhe de sintaxe: os blocos são separados
+# por vírgula, mas o PRIMEIRO não pode tê-la antes. Então, se for o primeiro,
+# só desligamos a flag; caso contrário, imprimimos a vírgula.
+#
+# Obs.: FIRST_BLOCK não é 'local' de propósito — ela é lida/escrita no loop
+# principal, que é quem a reinicia a 1 no começo de cada ciclo.
+emit_block() {
+    local name text
+
+    name=$(json_escape "$1")
+    text=$(json_escape "$2")
+
+    if (( FIRST_BLOCK )); then
+        FIRST_BLOCK=0
+    else
+        printf ','
+    fi
+
+    printf '{"name":"%s","full_text":"%s"}' "$name" "$text"
+}
+
+# -----------------------------------------------------------------------------
+# DORMINHOCO SEM SUBPROCESSO
+# -----------------------------------------------------------------------------
+# O comando 'sleep' cria um processo (fork+exec) a cada ciclo. Medimos esse
+# custo em ~1,6 ms por iteração — o mais caro de todos os "dorminhocos".
+#
+# Truque: o builtin 'read -t SEGUNDOS' do bash espera por entrada durante até
+# SEGUNDOS, e ao estourar o tempo retorna (sem criar processo algum). Mas se o
+# descritor que estamos lendo chegar a EOF, o read retorna IMEDIATAMENTE — então
+# não podemos ler do stdin normal (que pode estar fechado).
+#
+# Solução: criar um FIFO (named pipe) e abri-lo para LEITURA E ESCRITA (<>).
+# Como nós mesmos mantemos o lado de escrita aberto, o read nunca vê EOF: ele
+# simplesmente espera e estoura o timeout. Em seguida o arquivo do FIFO é
+# removido do disco — o descritor (fd 3) continua aberto e válido, apontando
+# para um inode que já não tem nome. Sem lixo no sistema de arquivos.
+SLEEP_FD=""
+setup_sleep() {
+    local fifo
+    # mktemp -u gera um NOME livre (sem criar o arquivo) — vamos criar um FIFO.
+    fifo=$(mktemp -u "${TMPDIR:-/tmp}/mfetch-sleep.XXXXXX" 2>/dev/null) || return 1
+    mkfifo "$fifo" 2>/dev/null || return 1
+    # Abre o fd 3 em leitura+escrita: é isso que impede o EOF.
+    exec 3<>"$fifo" || { rm -f "$fifo"; return 1; }
+    rm -f "$fifo"
+    SLEEP_FD=3
+}
+
+# Dorme INTERVAL segundos. Se o FIFO não pôde ser criado (setup_sleep falhou),
+# cai de volta no 'sleep' tradicional — mais lento, porém sempre disponível.
+# O '|| :' garante que o status de timeout do read (não-zero) não interfira.
+sleep_interval() {
+    if [[ -n "$SLEEP_FD" ]]; then
+        read -t "$INTERVAL" -u "$SLEEP_FD" _ || :
+    else
+        sleep "$INTERVAL"
+    fi
+}
+
+# =============================================================================
+# CABEÇALHO DO PROTOCOLO i3bar
+# =============================================================================
+# Primeira linha: declaração de versão que o i3bar espera obrigatoriamente.
+printf '{"version":1,"click_events":false}\n'
+# Segunda linha: abertura do array contínuo de atualizações.
+printf '[\n'
+
+# Primeira linha de status (vazia): o i3bar exige um array antes de desenhar.
+printf '[],\n'
+
+# Ativa o dorminhoco sem fork. Se falhar, seguimos com o fallback interno.
+setup_sleep || :
+
+# =============================================================================
+# LOOP PRINCIPAL
+# =============================================================================
+# Repete indefinidamente. Cada passagem:
+#   1. abre o array do ciclo com '['
+#   2. chama as funções get_* (que gravam nas variáveis de texto)
+#   3. emite cada bloco JSON via emit_block
+#   4. fecha o array com '],'
+#   5. dorme INTERVAL segundos
+#
+# Chamamos as funções DIRETO (sem $( )): isso evita um subprocesso por bloco e,
+# no caso da CPU, preserva o estado entre as leituras.
+while :; do
+    FIRST_BLOCK=1
+
+    printf '['
+
+    get_cpu;      emit_block cpu     "CPU: $CPU_TEXT"
+    get_ram;      emit_block ram     "RAM: $RAM_TEXT"
+    get_network;  emit_block network "$NET_TEXT"
+    get_disk;     emit_block disk    "HDD: $DISK_TEXT"
+    get_battery;  emit_block battery "BAT: $BAT_TEXT"
+
+    # Relógio sem fork: o builtin printf do bash formata data/hora com %(...)T.
+    # O argumento -1 significa "agora". Isso substitui a chamada ao comando
+    # externo 'date' (que custava ~1,6 ms de fork por ser um processo).
+    printf -v CLOCK_TEXT '%(%d/%m/%Y %H:%M)T' -1
+    emit_block clock "$CLOCK_TEXT"
+
+    printf '],\n'
+
+    sleep_interval
+done
