@@ -42,4 +42,20 @@ O MFetch-statusbar foi feito exclusivamente para o i3, qualquer outra Window Man
 ## Instalação
 
 ```bash
-git clone 
+git clone https://github.com/Ex3cutor76-V1/MFetch-i3status.git
+cd MFetch-i3status/
+sudo mv mfetch-statusbar /usr/local/bin/
+```
+Após fazer isso é recomendado também que você use
+```
+nano ~/.config/i3/config
+```
+
+E encontre a parte de "bar {" e coloque:
+
+```bash
+ bar {
+    status_command mfetch-statusbar
+}
+```
+E após isso você pode resetar o i3 usando `mod+shift+r` (Ou se caso você usa o DeByte Linux, use `mod+shift+c`)
