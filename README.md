@@ -59,3 +59,7 @@ E encontre a parte de "bar {" e coloque:
 }
 ```
 E após isso você pode resetar o i3 usando `mod+shift+r` (Ou se caso você usa o DeByte Linux, use `mod+shift+c`)
+
+## MFetch
+
+Caso você queira conhecer o projeto MFetch (Um antigo projeto que fiz em bash), você pode ver em [MFetch](https://github.com/Ex3cutor76-V1/MFetch)
