@@ -42,8 +42,8 @@ O MFetch-statusbar foi feito exclusivamente para o i3, qualquer outra Window Man
 ## Instalação
 
 ```bash
-git clone https://github.com/Ex3cutor76-V1/MFetch-i3status.git
-cd MFetch-i3status/
+https://github.com/Ex3cutor76-V1/MFetch-statusbar.git
+cd MFetch-statusbar/
 sudo mv mfetch-statusbar /usr/local/bin/
 ```
 Após fazer isso é recomendado também que você use
